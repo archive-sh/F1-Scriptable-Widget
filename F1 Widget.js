@@ -1,6 +1,9 @@
 // Session-aware F1 schedule, standings, and live-order widget for Scriptable.
 const JOLPICA_BASE = "https://api.jolpi.ca/ergast/f1";
 const OPENF1_BASE = "https://api.openf1.org/v1";
+const OPENF1_CREDENTIALS_KEY = "f1-widget-openf1-credentials";
+const OPENF1_TOKEN_KEY = "f1-widget-openf1-token";
+let openF1Token = (args.widgetParameter || "").trim();
 const CACHE_FILE = "f1-widget-cache.json";
 const ACTIVE_REFRESH_MINUTES = 2;
 const IDLE_REFRESH_MINUTES = 15;
@@ -67,7 +70,100 @@ const RACE_LAPS = {
 async function requestJSON(url) {
   const request = new Request(url);
   request.timeoutInterval = 12;
-  return request.loadJSON();
+  if (url.startsWith(OPENF1_BASE) && openF1Token) {
+    request.headers = { Authorization: `Bearer ${openF1Token}` };
+  }
+  let value;
+  try {
+    value = await request.loadJSON();
+  } catch (error) {
+    error.statusCode = request.response?.statusCode || error.statusCode;
+    throw error;
+  }
+  const statusCode = request.response?.statusCode || 200;
+  if (statusCode >= 400) {
+    const error = new Error(value?.detail || `Request failed (${statusCode})`);
+    error.statusCode = statusCode;
+    throw error;
+  }
+  return value;
+}
+
+function keychainJSON(key) {
+  if (!Keychain.contains(key)) return null;
+  try {
+    return JSON.parse(Keychain.get(key));
+  } catch (_) {
+    return null;
+  }
+}
+
+async function getOpenF1Token() {
+  if (openF1Token) return openF1Token;
+  const savedToken = keychainJSON(OPENF1_TOKEN_KEY);
+  if (savedToken?.value && savedToken.expiresAt > Date.now() + 60000) return savedToken.value;
+
+  const credentials = keychainJSON(OPENF1_CREDENTIALS_KEY);
+  if (!credentials?.username || !credentials?.password) return "";
+
+  const request = new Request("https://api.openf1.org/token");
+  request.method = "POST";
+  request.headers = { "Content-Type": "application/x-www-form-urlencoded" };
+  request.body = `username=${encodeURIComponent(credentials.username)}&password=${encodeURIComponent(credentials.password)}`;
+  request.timeoutInterval = 12;
+  try {
+    const response = await request.loadJSON();
+    if ((request.response?.statusCode || 200) >= 400 || !response.access_token) return "";
+    const expiresIn = Number(response.expires_in) || 3600;
+    Keychain.set(OPENF1_TOKEN_KEY, JSON.stringify({
+      value: response.access_token,
+      expiresAt: Date.now() + expiresIn * 1000,
+    }));
+    return response.access_token;
+  } catch (_) {
+    return "";
+  }
+}
+
+async function configureOpenF1() {
+  const existing = keychainJSON(OPENF1_CREDENTIALS_KEY) || {};
+  const alert = new Alert();
+  alert.title = "OpenF1 Live Access";
+  alert.message = "Enter paid OpenF1 credentials. They are stored only in iOS Keychain.";
+  alert.addTextField("Username", existing.username || "");
+  alert.addSecureTextField("Password");
+  alert.addAction("Save");
+  alert.addCancelAction("Cancel");
+  if (await alert.presentAlert() !== 0) return false;
+
+  const username = alert.textFieldValue(0).trim();
+  const password = alert.textFieldValue(1);
+  if (!username || !password) return false;
+  Keychain.set(OPENF1_CREDENTIALS_KEY, JSON.stringify({ username, password }));
+  if (Keychain.contains(OPENF1_TOKEN_KEY)) Keychain.remove(OPENF1_TOKEN_KEY);
+  openF1Token = "";
+  return true;
+}
+
+async function interactiveAction() {
+  const menu = new Alert();
+  menu.title = "F1 Widget";
+  menu.addAction("Preview Medium");
+  menu.addAction("Preview Large");
+  menu.addAction("Configure OpenF1 Live Access");
+  if (Keychain.contains(OPENF1_CREDENTIALS_KEY)) menu.addDestructiveAction("Remove OpenF1 Credentials");
+  const choice = await menu.presentSheet();
+  if (choice === 2) {
+    await configureOpenF1();
+    return "medium";
+  }
+  if (choice === 3) {
+    Keychain.remove(OPENF1_CREDENTIALS_KEY);
+    if (Keychain.contains(OPENF1_TOKEN_KEY)) Keychain.remove(OPENF1_TOKEN_KEY);
+    openF1Token = "";
+    return "medium";
+  }
+  return choice === 1 ? "large" : "medium";
 }
 
 function readCache(fileManager, cachePath) {
@@ -101,13 +197,41 @@ function relevantRace(schedule, now) {
 }
 
 function findMeeting(meetings, race) {
-  if (!race) return null;
+  if (!race || !Array.isArray(meetings)) return null;
   const target = new Date(`${race.date}T12:00:00Z`).getTime();
   return meetings
     .filter((meeting) => !meeting.meeting_name.includes("Testing"))
     .map((meeting) => ({ meeting, distance: Math.abs(new Date(meeting.date_end).getTime() - target) }))
     .filter(({ distance }) => distance < 4 * 86400000)
     .sort((a, b) => a.distance - b.distance)[0]?.meeting || null;
+}
+
+function scheduleSessions(race) {
+  if (!race) return [];
+  const definitions = [
+    ["Practice 1", "Practice", race.FirstPractice, 60],
+    ["Practice 2", "Practice", race.SecondPractice, 60],
+    ["Practice 3", "Practice", race.ThirdPractice, 60],
+    ["Sprint Qualifying", "Qualifying", race.SprintQualifying, 60],
+    ["Sprint", "Race", race.Sprint, 60],
+    ["Qualifying", "Qualifying", race.Qualifying, 60],
+    ["Race", "Race", { date: race.date, time: race.time }, 120],
+  ];
+  return definitions
+    .filter(([, , session]) => session?.date)
+    .map(([sessionName, sessionType, session, durationMinutes]) => {
+      const start = new Date(`${session.date}T${session.time || "00:00:00Z"}`);
+      return {
+        session_key: null,
+        session_name: sessionName,
+        session_type: sessionType,
+        date_start: start.toISOString(),
+        date_end: new Date(start.getTime() + durationMinutes * 60000).toISOString(),
+        circuit_short_name: race.Circuit?.circuitName,
+        is_cancelled: false,
+        is_schedule_fallback: true,
+      };
+    });
 }
 
 function isPractice(session) {
@@ -172,17 +296,20 @@ function latestPositions(records) {
 }
 
 async function loadData(now) {
+  openF1Token = await getOpenF1Token();
   const fileManager = FileManager.local();
   const cachePath = fileManager.joinPath(fileManager.documentsDirectory(), CACHE_FILE);
   const cached = readCache(fileManager, cachePath);
   const fresh = {};
+  let openF1Restricted = false;
 
   async function cachedRequest(key, url) {
     try {
       const value = await requestJSON(url);
       fresh[key] = value;
       return value;
-    } catch (_) {
+    } catch (error) {
+      if (url.startsWith(OPENF1_BASE) && error.statusCode === 401) openF1Restricted = true;
       return cached[key];
     }
   }
@@ -197,17 +324,20 @@ async function loadData(now) {
 
   if (!schedule) throw new Error("The F1 schedule is unavailable");
   const race = relevantRace(schedule, now);
-  const meeting = findMeeting(meetings || [], race);
+  const meeting = findMeeting(Array.isArray(meetings) ? meetings : [], race);
   const sessionCacheKey = meeting ? `sessions-${meeting.meeting_key}` : null;
-  const sessions = meeting
+  const openF1Sessions = meeting
     ? await cachedRequest(sessionCacheKey, `${OPENF1_BASE}/sessions?meeting_key=${meeting.meeting_key}`)
     : [];
-  const state = deriveState(now, race, sessions || []);
+  const sessions = Array.isArray(openF1Sessions) && openF1Sessions.length > 0
+    ? openF1Sessions
+    : scheduleSessions(race);
+  const state = deriveState(now, race, sessions);
   let sessionResults = [];
   let drivers = [];
   let raceControl = [];
 
-  if (state.displaySession) {
+  if (state.displaySession?.session_key) {
     const key = state.displaySession.session_key;
     if (state.isActive && !isPractice(state.displaySession)) {
       const positions = await cachedRequest(`positions-${key}`, `${OPENF1_BASE}/position?session_key=${key}`);
@@ -250,6 +380,7 @@ async function loadData(now) {
     sessionResults: sessionResults || [],
     drivers: drivers || [],
     raceControl,
+    openF1Restricted,
   };
 }
 
@@ -416,6 +547,14 @@ function addResults(parent, heading, results, drivers, limit, incidents = {}) {
   }
 }
 
+function addUnavailableResults(parent, heading, restricted) {
+  addText(parent, heading.toUpperCase(), 10, COLORS.red, "bold");
+  parent.addSpacer(6);
+  addText(parent, restricted ? "LIVE DATA LOCKED" : "RESULTS PENDING", 11, COLORS.primary, "bold");
+  parent.addSpacer(3);
+  addText(parent, restricted ? "Add OpenF1 token" : "Waiting for timing data", 9, COLORS.secondary);
+}
+
 function addRaceResults(parent, results, drivers, family, incidents) {
   const ordered = orderedResults(results);
   const total = family === "large" ? 20 : 10;
@@ -467,7 +606,11 @@ function buildWidget(data, family) {
   left.layoutVertically();
   left.size = new Size(COLUMN_WIDTH, 0);
   if (data.state.mode === "session") {
-    addResults(left, data.state.displaySession.session_name, data.sessionResults, data.drivers, family === "large" ? 10 : 5);
+    if (data.sessionResults.length > 0) {
+      addResults(left, data.state.displaySession.session_name, data.sessionResults, data.drivers, family === "large" ? 10 : 5);
+    } else {
+      addUnavailableResults(left, data.state.displaySession.session_name, data.openF1Restricted);
+    }
   } else {
     const standingsLimit = family === "large" ? 6 : 5;
     const standingsRowGap = family === "large" ? 7 : 3;
@@ -488,7 +631,9 @@ function buildWidget(data, family) {
 
 async function run() {
   let widget;
-  const family = config.widgetFamily || "medium";
+  const family = config.runsInWidget
+    ? (config.widgetFamily || "medium")
+    : await interactiveAction();
   try {
     widget = buildWidget(await loadData(new Date()), family);
   } catch (_) {
